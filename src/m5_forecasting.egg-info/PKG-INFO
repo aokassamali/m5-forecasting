@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: m5-forecasting
+Version: 0.1.0
+Summary: M5 forecasting baseline (LightGBM) with reproducible pipeline.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=2.1
+Requires-Dist: numpy>=1.26
+Requires-Dist: pyarrow>=15.0
+Requires-Dist: lightgbm>=4.3
+Requires-Dist: scikit-learn>=1.4
+Requires-Dist: tyro>=0.8
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: tqdm>=4.66
+Requires-Dist: kaggle>=1.6
+Provides-Extra: dev
+Requires-Dist: ruff>=0.6; extra == "dev"
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ipykernel>=6.29; extra == "dev"
