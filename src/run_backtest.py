@@ -79,11 +79,11 @@ def _forecast(
             df,
             cutoff_day=cutoff_day,
             horizon=horizon,
-            recursive=lgbm_recursive,
             feat_cfg=feat_cfg,
             model_cfg=lgbm_cfg,
             train_window_days=train_window_days,
         )
+
 
     raise ValueError(f"Unknown model: {model}")
 

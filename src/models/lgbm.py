@@ -1,39 +1,30 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Optional
 
-import inspect
 import numpy as np
 import pandas as pd
-
 import lightgbm as lgb
 
+from features import FeatureConfig, build_feature_frame_direct
 
-# -----------------------------
+
+# ----------------------------
 # Config
-# -----------------------------
-
+# ----------------------------
 @dataclass
 class LGBMConfig:
-    """
-    LightGBM config for M5.
+    # Core objective for the conditional-mean regressor (used in hurdle regressor on y>0)
+    objective: str = "regression"  # "regression" or "poisson" recommended here
 
-    Notes:
-    - hurdle=True trains a binary classifier for y>0 and a regressor on positive rows, then predicts y_hat = p*mu.
-    - objective applies to the regressor ("regression", "poisson", etc.).
-    """
-
-    # Regressor objective
-    objective: str = "poisson"
-
-    # Core tree params
-    num_leaves: int = 31
+    # Tree params
+    num_leaves: int = 63
     learning_rate: float = 0.05
-    n_estimators: int = 300
-    min_child_samples: int = 20
+    n_estimators: int = 400
+    min_child_samples: int = 50
 
-    # Regularization / sampling
+    # Sampling / regularization
     subsample: float = 0.8
     colsample_bytree: float = 0.8
     reg_alpha: float = 0.0
@@ -44,76 +35,55 @@ class LGBMConfig:
     n_jobs: int = -1
     verbosity: int = -1
 
-    # Hurdle model
-    hurdle: bool = False
+    # Hurdle
+    hurdle: bool = True
 
-    # Classifier params (kept separate so you can tune quickly)
-    clf_num_leaves: int = 31
-    clf_learning_rate: float = 0.05
-    clf_n_estimators: int = 200
-    clf_min_child_samples: int = 20
-
-    # Safety: clip predictions
-    clip_negative_to_zero: bool = True
-
+    # Optional (you said you added this already; leaving it here for completeness)
     tweedie_variance_power: float = 1.1
 
-
-# -----------------------------
-# Helpers
-# -----------------------------
-
-def _as_frame(X: Any, feature_names: Optional[list[str]] = None) -> pd.DataFrame | Any:
-    """Ensure we keep pandas dtypes (esp. categoricals) if the upstream builder returns a DataFrame."""
-    if isinstance(X, pd.DataFrame):
-        return X
-    if feature_names is not None:
-        return pd.DataFrame(X, columns=feature_names)
-    return X
+    # Experts / routing
+    use_experts: bool = False
+    sparse_tier_name: str = "High"
+    sparse_p_threshold: float = 0.0  # set to 0.5 to gate sparse positives
 
 
-def _call_make_train_forecast_matrices(
-    df: pd.DataFrame,
-    cutoff_day: int,
-    feat_cfg: Any,
-    *,
-    dropna_train: bool,
-    train_window_days: Optional[int],
-):
-    """
-    Calls src.features.make_train_forecast_matrices but only passes kwargs that exist,
-    to avoid constant signature churn breaking everything.
-    """
-    from features import make_train_forecast_matrices  # local import to avoid import cycles
+# ----------------------------
+# Internal helpers
+# ----------------------------
+def _categorical_features(X: pd.DataFrame) -> list[str]:
+    return [c for c in X.columns if str(X[c].dtype) == "category"]
 
-    fn = make_train_forecast_matrices
-    sig = inspect.signature(fn)
+def _ensure_categoricals(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    df = df.copy()
+    for c in cols:
+        if c in df.columns and str(df[c].dtype) != "category":
+            df[c] = df[c].astype("category")
+    return df
 
-    kwargs: dict[str, Any] = {}
-    if "dropna_train" in sig.parameters:
-        kwargs["dropna_train"] = dropna_train
-    if "train_window_days" in sig.parameters:
-        kwargs["train_window_days"] = train_window_days
 
-    out = fn(df, cutoff_day, feat_cfg, **kwargs)
 
-    # Expected (based on your earlier trace):
-    #   X_train, y_train, X_forecast, ids_forecast, feature_cols
-    # But we’ll tolerate missing feature_cols.
-    if len(out) == 5:
-        return out
-    if len(out) == 4:
-        X_train, y_train, X_forecast, ids_forecast = out
-        return X_train, y_train, X_forecast, ids_forecast, None
-
-    raise ValueError(
-        "make_train_forecast_matrices returned unexpected number of outputs. "
-        f"Expected 4 or 5, got {len(out)}."
+def _build_classifier(cfg: LGBMConfig) -> lgb.LGBMClassifier:
+    # Goal: good calibration of P(y>0)
+    return lgb.LGBMClassifier(
+        objective="binary",
+        num_leaves=cfg.num_leaves,
+        learning_rate=cfg.learning_rate,
+        n_estimators=max(200, cfg.n_estimators // 2),
+        min_child_samples=cfg.min_child_samples,
+        subsample=cfg.subsample,
+        colsample_bytree=cfg.colsample_bytree,
+        reg_alpha=cfg.reg_alpha,
+        reg_lambda=cfg.reg_lambda,
+        random_state=cfg.random_state,
+        n_jobs=cfg.n_jobs,
+        verbose=cfg.verbosity,
     )
 
 
 def _build_regressor(cfg: LGBMConfig) -> lgb.LGBMRegressor:
-    params = dict(
+    # Note: we are intentionally NOT using tweedie here because it performed catastrophically
+    # in your current setup. Keep objective in {"regression","poisson"} for now.
+    return lgb.LGBMRegressor(
         objective=cfg.objective,
         num_leaves=cfg.num_leaves,
         learning_rate=cfg.learning_rate,
@@ -128,128 +98,221 @@ def _build_regressor(cfg: LGBMConfig) -> lgb.LGBMRegressor:
         verbose=cfg.verbosity,
     )
 
-    # Tweedie-specific parameter
-    if cfg.objective == "tweedie":
-        params["tweedie_variance_power"] = cfg.tweedie_variance_power
 
-    return lgb.LGBMRegressor(**params)
+def _compute_intermittency_tiers(
+    df: pd.DataFrame,
+    cutoff_day: int,
+    n_tiers: int = 3,
+) -> pd.DataFrame:
+    """
+    Training-only intermittency tiers by % zero-sales days.
+    Matches your slicing logic: qcut over per-series zero_pct.
+    """
+    train = df[df["day_index"] <= cutoff_day][["item_id", "store_id", "sales"]].copy()
+    grp = train.groupby(["item_id", "store_id"], sort=False)["sales"]
 
+    # % of days with zero sales
+    zero_pct = grp.apply(lambda s: float((s == 0).mean())).reset_index(name="zero_pct")
 
-
-def _build_classifier(cfg: LGBMConfig) -> lgb.LGBMClassifier:
-    return lgb.LGBMClassifier(
-        objective="binary",
-        num_leaves=cfg.clf_num_leaves,
-        learning_rate=cfg.clf_learning_rate,
-        n_estimators=cfg.clf_n_estimators,
-        min_child_samples=cfg.clf_min_child_samples,
-        subsample=cfg.subsample,
-        colsample_bytree=cfg.colsample_bytree,
-        reg_alpha=cfg.reg_alpha,
-        reg_lambda=cfg.reg_lambda,
-        random_state=cfg.random_state,
-        n_jobs=cfg.n_jobs,
-        verbose=cfg.verbosity,
+    labels = ["Low", "Medium", "High"][:n_tiers]
+    zero_pct["intermittency_tier"] = pd.qcut(
+        zero_pct["zero_pct"],
+        q=n_tiers,
+        labels=labels,
+        duplicates="drop",
     )
 
+    return zero_pct[["item_id", "store_id", "zero_pct", "intermittency_tier"]]
 
-# -----------------------------
-# Public API
-# -----------------------------
 
+def _fit_hurdle(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    cfg: LGBMConfig,
+) -> tuple[lgb.LGBMClassifier, lgb.LGBMRegressor]:
+    """
+    Fit:
+      - classifier on y>0
+      - regressor on y (only where y>0)
+    """
+    # Force known ID columns to category if present (LightGBM requires this)
+    force_cat = ["item_id", "dept_id", "cat_id", "store_id", "state_id", "weekday", "event_type_1"]
+    X_train = X_train.copy()
+    for c in force_cat:
+        if c in X_train.columns and str(X_train[c].dtype) != "category":
+            X_train[c] = X_train[c].astype("category")
+
+    clf = _build_classifier(cfg)
+    reg = _build_regressor(cfg)
+
+    cat_cols = _categorical_features(X_train)
+
+    y_bin = (y_train > 0).astype(int)
+    clf.fit(X_train, y_bin, categorical_feature=cat_cols)
+
+    pos_mask = y_train > 0
+    if int(pos_mask.sum()) == 0:
+        # Degenerate: no positive examples
+        # Still return fitted classifier; regressor will never be used meaningfully
+        reg.fit(X_train.iloc[:1], y_train.iloc[:1], categorical_feature=cat_cols)
+        return clf, reg
+
+    reg.fit(X_train.loc[pos_mask], y_train.loc[pos_mask], categorical_feature=cat_cols)
+    return clf, reg
+
+
+def _predict_hurdle(
+    clf: lgb.LGBMClassifier,
+    reg: lgb.LGBMRegressor,
+    X_forecast: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (p_positive, mu_positive).
+    """
+    # Force categoricals
+    force_cat = ["item_id", "dept_id", "cat_id", "store_id", "state_id", "weekday", "event_type_1"]
+    X_forecast = X_forecast.copy()
+    for c in force_cat:
+        if c in X_forecast.columns and str(X_forecast[c].dtype) != "category":
+            X_forecast[c] = X_forecast[c].astype("category")
+
+    # P(y>0)
+    p = clf.predict_proba(X_forecast)[:, 1]
+
+    # E[y | y>0] (regressor trained only on positives)
+    mu = reg.predict(X_forecast)
+
+    # Safety: enforce nonnegativity
+    mu = np.maximum(mu, 0.0)
+    print("p stats:", np.quantile(p, [0, .5, .9, .99, 1]))
+    print("mu stats:", np.quantile(mu, [0, .5, .9, .99, 1]))
+
+    return p, mu
+
+
+# ----------------------------
+# Public API used by run_backtest
+# ----------------------------
 def lgbm_forecast(
     df: pd.DataFrame,
-    *,
     cutoff_day: int,
     horizon: int,
-    recursive: bool,
-    feat_cfg: Any,
+    *,
+    feat_cfg: FeatureConfig,
     model_cfg: LGBMConfig,
     dropna_train: bool = True,
     train_window_days: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Train LightGBM (optionally hurdle) and forecast.
+    Train (one or two) hurdle LightGBM models and forecast cutoff+1..cutoff+horizon.
 
     Returns:
         DataFrame with columns [item_id, store_id, day_index, y_pred]
     """
-    # If your FeatureConfig stores horizon, keep it consistent with the backtest horizon
-    # (This is important if your feature builder uses horizon internally.)
-    if hasattr(feat_cfg, "horizon") and getattr(feat_cfg, "horizon") != horizon:
-        try:
-            # dataclass-style replace
-            feat_cfg = type(feat_cfg)(**{**feat_cfg.__dict__, "horizon": horizon})
-        except Exception:
-            # best effort — if it isn't a dataclass, just overwrite
-            setattr(feat_cfg, "horizon", horizon)
+    # Force feature horizon to match backtest horizon
+    print("LGBMConfig:", model_cfg)
 
-    # Build train and forecast matrices from your feature pipeline
-    X_train, y_train, X_forecast, ids_forecast, feature_cols = _call_make_train_forecast_matrices(
-        df=df,
-        cutoff_day=cutoff_day,
-        feat_cfg=feat_cfg,
-        dropna_train=dropna_train,
-        train_window_days=train_window_days,
+    feat_cfg = FeatureConfig(
+        horizon=horizon,
+        lag_days=feat_cfg.lag_days,
+        roll_windows=feat_cfg.roll_windows,
+        price_lag_days=feat_cfg.price_lag_days,
+        price_roll_windows=feat_cfg.price_roll_windows,
+        include_event_type=feat_cfg.include_event_type,
+        include_intermittency_state=getattr(feat_cfg, "include_intermittency_state", True),
+        days_since_nonzero_cap=getattr(feat_cfg, "days_since_nonzero_cap", 999),
     )
 
-    X_train = _as_frame(X_train, feature_cols)
-    X_forecast = _as_frame(X_forecast, feature_cols)
+    feat_df, feature_cols = build_feature_frame_direct(df, cutoff_day, feat_cfg)
 
-    # We keep ids_forecast as the identity table for the forecast rows
-    # It should contain: item_id, store_id, day_index
-    if not isinstance(ids_forecast, pd.DataFrame):
-        raise ValueError("ids_forecast must be a DataFrame with identifiers for the forecast rows.")
+    # Train / forecast split (what you pasted)
+    train = feat_df[feat_df["day_index"] <= cutoff_day].copy()
+    forecast = feat_df[
+        (feat_df["day_index"] > cutoff_day) & (feat_df["day_index"] <= cutoff_day + horizon)
+    ].copy()
 
-    # -----------------------------
-    # Train
-    # -----------------------------
-    reg = _build_regressor(model_cfg)
+    # Ensure LightGBM can accept ID columns as categoricals
+    cat_force = ["item_id", "dept_id", "cat_id", "store_id", "state_id", "weekday", "event_type_1"]
+    train = _ensure_categoricals(train, cat_force)
+    forecast = _ensure_categoricals(forecast, cat_force)
 
-    if model_cfg.hurdle:
-        # Classifier on all train rows
-        y_bin = (pd.Series(y_train) > 0).astype(int).to_numpy()
-        clf = _build_classifier(model_cfg)
-        clf.fit(X_train, y_bin)
 
-        # Regressor trained only on positive rows
-        pos_mask = y_bin == 1
-        if pos_mask.sum() == 0:
-            # Degenerate edge-case: no positive examples in training window.
-            # Fall back to always predicting 0.
-            y_pred = np.zeros(len(ids_forecast), dtype=float)
-        else:
-            reg.fit(X_train.loc[pos_mask] if isinstance(X_train, pd.DataFrame) else X_train[pos_mask], np.asarray(y_train)[pos_mask])
+    # Optional rolling train window
+    if train_window_days is not None:
+        lo = cutoff_day - int(train_window_days) + 1
+        train = train[train["day_index"] >= lo].copy()
 
-            p = clf.predict_proba(X_forecast)[:, 1]
-            mu = reg.predict(X_forecast)
+    # Drop NA rows (mostly from lags/rolls)
+    if dropna_train:
+        train = train.dropna(subset=feature_cols + ["sales"]).copy()
 
-            y_pred = p * mu
+    # Matrices
+    X_train = train[feature_cols]
+    y_train = train["sales"].astype(float)
+
+    X_forecast = forecast[feature_cols]
+    ids_forecast = forecast[["item_id", "store_id", "day_index"]].copy()
+
+    # Expert routing label (per series, training only)
+    if model_cfg.use_experts:
+        tiers = _compute_intermittency_tiers(df, cutoff_day=cutoff_day)
+        # Attach tier to both train and forecast rows
+        train = train.merge(tiers[["item_id", "store_id", "intermittency_tier"]],
+                            on=["item_id", "store_id"], how="left")
+        forecast = forecast.merge(tiers[["item_id", "store_id", "intermittency_tier"]],
+                                  on=["item_id", "store_id"], how="left")
+
+        sparse_name = model_cfg.sparse_tier_name
+        is_sparse_train = (train["intermittency_tier"] == sparse_name).fillna(False)
+        is_sparse_forecast = (forecast["intermittency_tier"] == sparse_name).fillna(False)
+
+        # Dense expert: everything NOT sparse
+        dense_train = train.loc[~is_sparse_train].copy()
+        sparse_train = train.loc[is_sparse_train].copy()
+
+        # If a split is empty, fall back to global training for that expert
+        if len(dense_train) == 0:
+            dense_train = train.copy()
+        if len(sparse_train) == 0:
+            sparse_train = train.copy()
+
+        # Fit experts
+        clf_dense, reg_dense = _fit_hurdle(dense_train[feature_cols], dense_train["sales"], model_cfg)
+        clf_sparse, reg_sparse = _fit_hurdle(sparse_train[feature_cols], sparse_train["sales"], model_cfg)
+
+        # Predict
+        p_dense, mu_dense = _predict_hurdle(clf_dense, reg_dense, X_forecast)
+        p_sparse, mu_sparse = _predict_hurdle(clf_sparse, reg_sparse, X_forecast)
+
+        # Combine with routing
+        y_pred = np.empty(len(forecast), dtype=float)
+
+        # Default: dense prediction
+        y_pred[:] = p_dense * mu_dense
+
+        # Sparse routes
+        sparse_idx = np.where(is_sparse_forecast.to_numpy())[0]
+        if len(sparse_idx) > 0:
+            p_s = p_sparse[sparse_idx]
+            mu_s = mu_sparse[sparse_idx]
+
+            # Apply sparse gating threshold
+            thr = float(model_cfg.sparse_p_threshold)
+            if thr > 0.0:
+                gated = (p_s >= thr).astype(float)  # 1 if confident positive else 0
+                y_pred[sparse_idx] = gated * (p_s * mu_s)
+            else:
+                y_pred[sparse_idx] = p_s * mu_s
+
     else:
-        reg.fit(X_train, y_train)
-        y_pred = reg.predict(X_forecast)
+        # Single global hurdle
+        clf, reg = _fit_hurdle(X_train, y_train, model_cfg)
+        p, mu = _predict_hurdle(clf, reg, X_forecast)
+        y_pred = p * mu
 
-    # -----------------------------
-    # Post-process
-    # -----------------------------
-    y_pred = np.asarray(y_pred, dtype=float)
-
-    if model_cfg.clip_negative_to_zero:
-        y_pred = np.clip(y_pred, 0.0, None)
-
-    # NOTE: "recursive" is accepted for API hygiene.
-    # With your current leakage-safe features (min lag >= horizon), recursion usually does not change inputs.
-    # A real recursive pipeline requires lag features < horizon (e.g., lag_1..lag_7), which your current builder likely avoids.
-    # We keep the flag so run_backtest can pass it, but forecasting here is "direct" over the horizon.
-    _ = recursive  # intentionally unused
+    # Final safety
+    y_pred = np.maximum(y_pred, 0.0)
 
     out = ids_forecast.copy()
-    out["y_pred"] = y_pred
-
-    # Normalize output columns
-    expected_cols = ["item_id", "store_id", "day_index", "y_pred"]
-    missing = [c for c in expected_cols if c not in out.columns]
-    if missing:
-        raise ValueError(f"Forecast output is missing columns: {missing}. Got columns: {list(out.columns)}")
-
-    return out[expected_cols]
+    out["y_pred"] = y_pred.astype(float)
+    return out
