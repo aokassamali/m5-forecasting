@@ -2,14 +2,19 @@
 
 An evaluation methodology, honest baseline comparison, and interpretable error analysis on Walmart's M5 retail dataset.
 
+> **Important:** The headline metric reported below is a **bottom-level WRMSSE proxy** (item × store only) intended for honest internal comparison across models in this repo.  
+> It is **not directly comparable** to Kaggle leaderboard WRMSSE for the official M5 Accuracy competition (which includes 12 hierarchical levels and an “active period” scaling rule).
+
+---
+
 ## Key Results
 
-| Model | WRMSSE | MAE | vs. Baseline |
-|-------|--------|-----|--------------|
+| Model | WRMSSE (proxy) | MAE | vs. Baseline |
+|-------|-----------------|-----|--------------|
 | Seasonal Naive (lag-7) | 1.32 ± 0.02 | 1.22 | — |
 | **LightGBM** | **1.03 ± 0.02** | **1.07** | **-22%** |
 
-LightGBM achieves a 22% reduction in WRMSSE compared to the seasonal naive baseline, with consistent performance across three rolling-origin evaluation windows.
+LightGBM achieves a ~22% reduction in this repo’s WRMSSE proxy compared to the seasonal naive baseline, with consistent performance across three rolling-origin evaluation windows.
 
 ---
 
@@ -22,14 +27,16 @@ Walmart operates 10 stores across 3 states (CA, TX, WI), selling 3,049 products 
 - **Labor planning**: Staff scheduling based on expected demand
 - **Supply chain coordination**: Warehouse allocation, transportation scheduling
 
-A 22% improvement in forecast accuracy translates directly to reduced safety stock requirements and improved service levels.
+A 22% improvement in forecast accuracy translates directly to reduced safety stock requirements and improved service levels—especially if improvements concentrate on the highest-revenue series.
 
-### Why WRMSSE?
-We use Weighted Root Mean Squared Scaled Error (WRMSSE) rather than simple MAE because:
+### Why WRMSSE (and why I call it a “proxy” here)
+WRMSSE (Weighted Root Mean Squared Scaled Error) is useful because it is:
 
-1. **Scale-invariant**: An error of 5 units means different things for an item selling 100/day vs 1/day
-2. **Revenue-weighted**: High-revenue items contribute more to the metric, aligning with business impact
-3. **Benchmarked**: Errors are scaled relative to a naive lag-1 baseline (WRMSSE = 1.0 means "no better than yesterday's value")
+1. **Scale-invariant**: An error of 5 units means different things for an item selling 100/day vs 1/day  
+2. **Business-weighted**: High-revenue items contribute more, aligning the score with impact  
+3. **Comparable across series**: Errors are scaled by each series’ historical “typical” day-to-day variation (via squared first differences)
+
+**Interpreting the value:** Lower is better. In this repo’s implementation, a value near **1.0** roughly means “forecast RMSE is on the order of the series’ typical day-to-day change in training.” It is **not** a literal statement about a lag-1 forecasting baseline unless you explicitly compute and compare to a lag-1 model.
 
 ---
 
@@ -54,6 +61,28 @@ All features are constructed using only data available at forecast time:
 - Price features are assumed known (retailers set prices in advance)
 - Calendar/SNAP features are deterministic
 
+> Note: The current forecasting mode is **one-step recursive**. This is simple to implement but can accumulate error across the 28-day rollout if features are not updated perfectly.
+
+---
+
+## Metric Details (What this repo computes)
+
+This repo computes a **bottom-level WRMSSE proxy** for item-store series:
+
+- **Scale per series**:  
+  \(\text{scale}_i = \sqrt{\mathbb{E}[(y_t - y_{t-1})^2]}\) over the training window  
+- **RMSSE per series** over the 28-day horizon:  
+  \(\mathrm{RMSSE}_i = \sqrt{\mathbb{E}[( (y - \hat y)/\text{scale}_i )^2]}\)
+- **Weights**: revenue share over the last 28 training days (units × price), normalized to sum to 1 across item-store series.
+
+### How this differs from official Kaggle M5 WRMSSE
+If you want a leaderboard-comparable WRMSSE, the official competition metric differs in two big ways:
+
+1. **Hierarchy:** official M5 evaluates **12 aggregation levels** (42,840 series), not just item-store.  
+2. **Scaling rule:** official M5 computes the scaling term after the series becomes “active” (after the first non-zero demand), whereas this repo’s current scale uses the full training window.
+
+This repo is explicit about this because the goal here is **honest, reproducible model comparison** and **clear error analysis**, not leaderboard replication.
+
 ---
 
 ## Model Comparison
@@ -61,11 +90,9 @@ All features are constructed using only data available at forecast time:
 ### Seasonal Naive Baseline
 **Prediction**: Sales for day t = Sales from day t-7 (same weekday last week)
 
-This captures weekly shopping patterns (weekend vs. weekday) with zero training required. If we can't beat a naive model, no point introducing complexity into forecasting system.
+This captures weekly shopping patterns (weekend vs. weekday) with zero training required. If we can't beat a naive model, no point introducing complexity into a forecasting system.
 
-**Results**: WRMSSE = 1.32
-
-Surprisingly, seasonal naive performs *worse* than the implicit lag-1 benchmark (WRMSSE > 1.0). Investigation via error slicing revealed why.
+**Results**: WRMSSE (proxy) = 1.32
 
 ### LightGBM
 **Features**:
@@ -80,7 +107,7 @@ Surprisingly, seasonal naive performs *worse* than the implicit lag-1 benchmark 
 - Trees: 200 estimators, 255 leaves, learning rate 0.03
 - Regularization: 80% row/column subsampling
 
-**Results**: WRMSSE = 1.03 ± 0.02
+**Results**: WRMSSE (proxy) = 1.03 ± 0.02
 
 ---
 
@@ -98,6 +125,8 @@ The aggregate WRMSSE hides critical heterogeneity. Slicing by item characteristi
 
 **Insight**: LightGBM improves across all volume tiers, with the largest relative gains on medium and low-volume items where seasonal naive struggles most.
 
+> Recommendation: also slice by **weight decile** (revenue share). Because WRMSSE is weighted, the “top decile” often dominates the overall score.
+
 ### By Demand Intermittency
 
 | Intermittency | Seasonal Naive | LightGBM | Winner |
@@ -106,13 +135,13 @@ The aggregate WRMSSE hides critical heterogeneity. Slicing by item characteristi
 | Medium | 1.45 | **1.11** | LightGBM (-23%) |
 | High (sporadic/zeros) | 1.95 | **1.48** | LightGBM (-24%) |
 
-**Insight**: Both models struggle with highly intermittent items (WRMSSE > 1.4), but LightGBM consistently outperforms. The challenge is fundamental: when an item sells 0-3 times per week randomly, even sophisticated models have limited signal.
+**Insight**: Both models struggle with highly intermittent items (WRMSSE > 1.4), but LightGBM consistently outperforms. The challenge is fundamental: when an item sells 0–3 times per week randomly, even sophisticated models have limited signal.
 
 ### Business Implication
 For a production system, consider **tiered model deployment**:
 
 - **High-volume, low-intermittency items**: LightGBM with tight prediction intervals → aggressive inventory optimization
-- **Sparse/intermittent items**: LightGBM with wider safety stock → prioritize service level over efficiency
+- **Sparse/intermittent items**: conservative policy + wider safety stock → prioritize service level over efficiency
 
 ---
 
@@ -163,7 +192,7 @@ m5-forecasting/
 │   └── processed/                # Prepared parquet
 ├── src/
 │   ├── data.py                   # Data loading and preparation
-│   ├── evaluation.py             # WRMSSE, MAE, RMSE metrics
+│   ├── evaluation.py             # WRMSSE proxy, MAE, RMSE metrics
 │   ├── slicing.py                # Volume/intermittency tier analysis
 │   ├── run_backtest.py           # Main orchestrator
 │   └── models/
@@ -184,37 +213,25 @@ m5-forecasting/
 
 ### Current Limitations
 
-1. **No hierarchical reconciliation**: Forecasts are made independently per item-store. In production, forecasts should be coherent across the hierarchy (item → department → store → total). Methods like MinTrace or bottom-up aggregation would ensure consistency.
+1. **Metric is a proxy (not official M5 WRMSSE):**  
+   - bottom-level only (item-store)  
+   - scale uses full training window (not “active period” only)  
+   - weights normalized across bottom series (not per-level across 12 levels)
 
-2. **Point forecasts only**: We predict expected sales but don't quantify uncertainty. For inventory optimization, prediction intervals (e.g., 80% coverage) are essential to set safety stock levels.
+2. **No hierarchical reconciliation:** Forecasts are made independently per item-store. In production, forecasts should be coherent across the hierarchy (item → department → store → total). Methods like bottom-up aggregation or optimal combination (e.g., MinTrace) ensure consistency.
 
-3. **Static model**: The model is trained once per cutoff. In production, concept drift (changing consumer behavior, new products, seasonality shifts) requires continuous monitoring and retraining triggers.
+3. **Point forecasts only:** We predict expected sales but don't quantify uncertainty. For inventory optimization, prediction intervals (e.g., 80% coverage) are essential to set safety stock levels.
 
-4. **No external data**: We use only sales, calendar, and price. Real systems incorporate weather, promotions calendar, competitor actions, and macroeconomic indicators.
+4. **Recursive rollout:** One-step recursive forecasting can drift over a 28-day horizon. A high-impact extension is **direct multi-horizon** prediction (28 targets) or a single model with a horizon feature + target shifting.
 
-### Recommended Extensions
+5. **No external data:** We use only sales, calendar, and price. Real systems incorporate weather, promotions calendar, competitor actions, and macroeconomic indicators.
 
-**For Production Deployment**:
+### Recommended Extensions (high-signal, hiring-relevant)
 
-1. **Prediction Intervals**: Train quantile regression models (10th/90th percentile) using LightGBM's `objective="quantile"`. Validate calibration: 80% of actuals should fall within bounds.
-
-2. **Hierarchical Reconciliation**: Implement bottom-up or optimal combination (MinTrace) to ensure store-level forecasts sum correctly to regional and national totals.
-
-3. **Monitoring Dashboard**: Track forecast accuracy in real-time. Alert on:
-   - Rolling WRMSSE exceeding threshold (e.g., > 1.2)
-   - Systematic bias (consistent over/under-prediction)
-   - Feature drift (input distributions shifting)
-
-4. **Automated Retraining**: Trigger model refresh when:
-   - Accuracy degrades beyond threshold
-   - New products launch (cold-start handling)
-   - Major events occur (e.g., pandemic, store remodel)
-
-**For Research**:
-
-1. **Neural approaches**: N-BEATS, Temporal Fusion Transformer for capturing complex temporal dynamics
-2. **Causal modeling**: Estimate true promotional lift vs. correlation
-3. **Intermittent demand**: Croston's method or specialized zero-inflated models for sparse items
+1. **Weight-decile slice report:** show where you win/lose on the highest-revenue series.
+2. **Lag-1 and MA(28) baselines:** verify “simple persistence” vs model for top-weight items.
+3. **Active-period scaling:** update `compute_scale()` to exclude pre-launch zeros and document the difference.
+4. **Direct multi-horizon LGBM:** improve top-weight stability and reduce rollout drift.
 
 ---
 
@@ -222,13 +239,13 @@ m5-forecasting/
 
 This project reinforced several principles:
 
-1. **Baselines matter**: The seasonal naive "underperformance" (WRMSSE > 1.0) was itself an insight—retail demand at the item-store level is noisier than expected. Starting with a simple baseline revealed this.
+1. **Baselines matter**: It’s easy to “win” against a weak baseline. Strong baselines (lag-1, lag-7, moving averages) calibrate whether the model is adding real value.
 
-2. **Aggregate metrics hide heterogeneity**: Overall WRMSSE of 1.03 sounds good, but high-intermittency items still have WRMSSE of 1.48. A production system needs segment-specific strategies.
+2. **Aggregate metrics hide heterogeneity**: Overall WRMSSE proxy of 1.03 sounds good, but high-intermittency items still have WRMSSE of 1.48. A production system needs segment-specific strategies.
 
-3. **Feature engineering > model complexity**: The winning approach used simple lag/rolling features with LightGBM. Attempts to add categorical embeddings (item_id, store_id) caused train/test distribution mismatches. Simpler was better.
+3. **Feature engineering > model complexity**: Most improvements came from getting lags/rollings/calendar/price features correct and leakage-free, not from “fancier” model classes.
 
-4. **Evaluation protocol is everything**: Rolling-origin backtesting with multiple cutoffs prevented overfitting to a single time period. The low variance across cutoffs (±0.02) gives confidence in the results.
+4. **Evaluation protocol is everything**: Rolling-origin backtesting with multiple cutoffs prevents overfitting to a single time period. Low variance across cutoffs (±0.02) increases confidence.
 
 ---
 
