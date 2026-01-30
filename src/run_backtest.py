@@ -1,17 +1,6 @@
 """
 Backtest orchestrator for M5 forecasting.
 
-Usage examples:
-
-# Naive baseline
-python .\src\run_backtest.py --model naive --cutoffs 1857 1885 1913 --save-predictions
-
-# LGBM direct (cutoff-anchored)
-python .\src\run_backtest.py --model lgbm --cutoffs 1913 --lgbm-recursive False
-
-# LGBM recursive (recommended) with train window
-python .\src\run_backtest.py --model lgbm --cutoffs 1913 --lgbm-recursive --train-window-days 365 --lgbm-cfg.objective regression
-
 Outputs:
 - results/metrics/backtest_{model}_{run_tag}.csv
 - results/summary/backtest_{model}_{run_tag}_summary.json
@@ -66,26 +55,12 @@ def _forecast(
         return seasonal_naive_predict(df, cutoff_day=cutoff_day, horizon=horizon, lag=lag)
 
     if model == "lgbm":
-        # Keep feat_cfg horizon synced for direct mode (recursive mode ignores feat_cfg)
-        feat_cfg = FeatureConfig(
-            horizon=horizon,
-            lag_days=feat_cfg.lag_days,
-            roll_windows=feat_cfg.roll_windows,
-            price_lag_days=feat_cfg.price_lag_days,
-            price_roll_windows=feat_cfg.price_roll_windows,
-            include_event_type=feat_cfg.include_event_type,
-        )
         return lgbm_forecast(
             df,
             cutoff_day=cutoff_day,
             horizon=horizon,
-            feat_cfg=feat_cfg,
             model_cfg=lgbm_cfg,
-            train_window_days=train_window_days,
         )
-
-
-    raise ValueError(f"Unknown model: {model}")
 
 
 def run_single_cutoff(

@@ -165,12 +165,11 @@ def build_feature_frame_direct(df: pd.DataFrame, cutoff_day: int, cfg: FeatureCo
 
     for w in cfg.roll_windows:
         out[f"roll_mean_{w}_from_h"] = g["sales"].transform(
-            lambda s: s.shift(cfg.horizon).rolling(window=w, min_periods=w).mean()
+            lambda s: s.shift(cfg.horizon).rolling(window=w, min_periods=1).mean()
         )
         out[f"roll_std_{w}_from_h"] = g["sales"].transform(
-            lambda s: s.shift(cfg.horizon).rolling(window=w, min_periods=w).std()
+            lambda s: s.shift(cfg.horizon).rolling(window=w, min_periods=1).std()
         )
-
     # Price features (known future): compute relative to row day with shift(1) to avoid using same-day price for rolling
     for pl in cfg.price_lag_days:
         out[f"price_lag_{pl}"] = g["sell_price"].shift(pl)
@@ -192,8 +191,6 @@ def build_feature_frame_direct(df: pd.DataFrame, cutoff_day: int, cfg: FeatureCo
         # price
         "sell_price",
     ]
-    if cfg.include_event_type:
-        feature_cols.append("event_type_1")
     
     if cfg.include_intermittency_state:
         feature_cols += ["nonzero_rate_train", "days_since_nonzero"]
