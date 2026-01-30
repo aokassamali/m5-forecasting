@@ -1,6 +1,6 @@
 # M5 Forecasting Harness
 
-A production-quality demand forecasting system demonstrating rigorous evaluation methodology, honest baseline comparison, and interpretable error analysis on Walmart's M5 retail dataset.
+An evaluation methodology, honest baseline comparison, and interpretable error analysis on Walmart's M5 retail dataset.
 
 ## Key Results
 
@@ -61,7 +61,7 @@ All features are constructed using only data available at forecast time:
 ### Seasonal Naive Baseline
 **Prediction**: Sales for day t = Sales from day t-7 (same weekday last week)
 
-This captures weekly shopping patterns (weekend vs. weekday) with zero training required. It's the "beat this or your ML added no value" benchmark.
+This captures weekly shopping patterns (weekend vs. weekday) with zero training required. If we can't beat a naive model, no point introducing complexity into forecasting system.
 
 **Results**: WRMSSE = 1.32
 
