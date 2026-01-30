@@ -70,9 +70,9 @@ All features are constructed using only data available at forecast time:
 This repo computes a **bottom-level WRMSSE proxy** for item-store series:
 
 - **Scale per series**:  
-  \(\text{scale}_i = \sqrt{\mathbb{E}[(y_t - y_{t-1})^2]}\) over the training window  
+  ![scale](https://latex.codecogs.com/png.latex?%5Ctext%7Bscale%7D_i%20%3D%20%5Csqrt%7B%5Cfrac%7B1%7D%7Bn_i-1%7D%5Csum_%7Bt%3D2%7D%5E%7Bn_i%7D%28y_t-y_%7Bt-1%7D%29%5E2%7D) 
 - **RMSSE per series** over the 28-day horizon:  
-  \(\mathrm{RMSSE}_i = \sqrt{\mathbb{E}[( (y - \hat y)/\text{scale}_i )^2]}\)
+  ![rmsse](https://latex.codecogs.com/png.latex?%5Cmathrm%7BRMSSE%7D_i%20%3D%20%5Csqrt%7B%5Cfrac%7B1%7Dh%5Csum_%7Bt%3D1%7D%5Eh%5Cleft%28%5Cfrac%7By_%7Bn%2Bt%7D-%5Chat%7By%7D_%7Bn%2Bt%7D%7D%7B%5Ctext%7Bscale%7D_i%7D%5Cright%29%5E2%7D)
 - **Weights**: revenue share over the last 28 training days (units × price), normalized to sum to 1 across item-store series.
 
 ### How this differs from official Kaggle M5 WRMSSE
